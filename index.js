@@ -272,10 +272,23 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
+        // 嚴格驗證格式：V8 會把 2/30 之類的非法日期自動進位（不回 Invalid Date），
+        // 所以先用正則檢查欄位範圍，再回比對 ISO 確認沒有進位。
+        const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(datePart);
+        const timeMatch = /^(\d{2}):(\d{2})$/.exec(timePart);
         const taipeiTime = new Date(`${datePart}T${timePart}+08:00`);
-        if (isNaN(taipeiTime.getTime())) {
+        const validRollover =
+          dateMatch &&
+          timeMatch &&
+          Number(timeMatch[1]) < 24 &&
+          Number(timeMatch[2]) < 60 &&
+          !isNaN(taipeiTime.getTime()) &&
+          // 用台北時區把解析結果格式化回 YYYY-MM-DD，與輸入比對是否被進位
+          taipeiTime.toLocaleDateString("en-CA", { timeZone: "Asia/Taipei" }) === datePart;
+
+        if (!validRollover) {
           return interaction.reply({
-            content: "❌ 時間格式錯誤，請使用 YYYY-MM-DD HH:MM 台北時間格式。",
+            content: "❌ 時間格式錯誤或日期不存在，請使用 YYYY-MM-DD HH:MM 台北時間格式（例如 2026-07-01 19:30）。",
             flags: [MessageFlags.Ephemeral],
           });
         }
@@ -348,13 +361,22 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
 
-        await GuildData.updateOne(
-          { guildId },
+        // 把「尚未結算」的守衛放進 query，靠 matchedCount 判斷是否真的搶到，
+        // 避免兩個 /result 並發時雙雙通過上面的讀取檢查而重複加分。
+        const res = await GuildData.updateOne(
+          { guildId, [`match_history.${matchId}`]: { $exists: false } },
           {
             $set: { [`match_history.${matchId}`]: winningTeam },
             ...(Object.keys(incOps).length > 0 && { $inc: incOps }),
           }
         );
+
+        if (res.matchedCount === 0) {
+          return interaction.reply({
+            content: `⚠️ 比賽 \`${matchId}\` 剛剛已被結算，若需修正請使用 \`/undoresult\` 回溯。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
 
         await interaction.reply({ content: `✅ 比賽 \`${matchId}\` 的勝隊是 \`${winningTeam}\`，積分已更新！` });
         break;
@@ -417,15 +439,18 @@ client.on("interactionCreate", async (interaction) => {
         if (sorted.length === 0) {
           msg += "尚無任何積分紀錄，快來預測！";
         } else {
-          for (let i = 0; i < sorted.length; i++) {
-            const [userId, score] = sorted[i];
-            try {
-              const user = await client.users.fetch(userId);
-              msg += `${i + 1}. ${user.username}：${score} 分\n`;
-            } catch {
-              msg += `${i + 1}. 未知使用者 (${userId})：${score} 分\n`;
-            }
-          }
+          // 並發抓取使用者名稱，避免人數多時逐一 await 造成逾時
+          const lines = await Promise.all(
+            sorted.map(async ([userId, score], i) => {
+              try {
+                const user = await client.users.fetch(userId);
+                return `${i + 1}. ${user.username}：${score} 分`;
+              } catch {
+                return `${i + 1}. 未知使用者 (${userId})：${score} 分`;
+              }
+            })
+          );
+          msg += lines.join("\n") + "\n";
         }
 
         await interaction.editReply({ content: msg });
@@ -476,6 +501,7 @@ client.on("interactionCreate", async (interaction) => {
 
         const count = {};
         for (const team of Object.values(rawPredictions)) {
+          if (typeof team !== "string") continue;
           const t = team.toUpperCase();
           count[t] = (count[t] || 0) + 1;
         }
@@ -506,8 +532,12 @@ client.on("interactionCreate", async (interaction) => {
         const alreadyPredicted = [];
 
         for (const [matchId] of doc.match_teams) {
-          const deadline = new Date(doc.match_schedules.get(matchId));
-          if (now > deadline) continue;
+          // 已結算、無排程、排程無效、或已截止的場次都跳過（fail-closed）
+          const scheduleStr = doc.match_schedules.get(matchId);
+          const deadline = new Date(scheduleStr);
+          if (doc.match_history.get(matchId) || !scheduleStr || isNaN(deadline.getTime()) || now > deadline) {
+            continue;
+          }
 
           const matchPredictions = doc.predictions.get(matchId);
           const rawPredictions = matchPredictions instanceof Map
@@ -592,13 +622,22 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
 
-        await GuildData.updateOne(
-          { guildId },
+        // 守衛條件放進 query：只有目前仍是這個 winner 時才回溯，
+        // 避免兩個 /undoresult 並發時重複扣分。
+        const res = await GuildData.updateOne(
+          { guildId, [`match_history.${matchId}`]: winner },
           {
             $unset: { [`match_history.${matchId}`]: "" },
             ...(Object.keys(incOps).length > 0 && { $inc: incOps }),
           }
         );
+
+        if (res.matchedCount === 0) {
+          return interaction.reply({
+            content: "⚠️ 此比賽剛剛已被回溯或重新結算，請重新確認狀態。",
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
 
         await interaction.reply({
           content: `🔄 已回溯比賽 \`${matchId}\` 結果，扣除 ${undoCount} 名預測 \`${winner}\` 使用者的 ${point} 分，請重新使用 \`/result\` 結算。`,
@@ -609,11 +648,12 @@ client.on("interactionCreate", async (interaction) => {
       case "addscore": {
         const target = interaction.options.getUser("使用者");
         const points = interaction.options.getInteger("分數");
-        const doc = await getServerData(guildId);
 
+        // 直接 $inc，不需先讀整份文件；upsert 確保 guild 文件不存在時也會建立
         await GuildData.updateOne(
           { guildId },
-          { $inc: { [`scores.${target.id}`]: points } }
+          { $inc: { [`scores.${target.id}`]: points } },
+          { upsert: true }
         );
 
         await interaction.reply({ content: `✅ 已增加 ${target.username} 的 ${points} 分` });
@@ -623,11 +663,11 @@ client.on("interactionCreate", async (interaction) => {
       case "subscore": {
         const target = interaction.options.getUser("使用者");
         const points = interaction.options.getInteger("分數");
-        const doc = await getServerData(guildId);
 
         await GuildData.updateOne(
           { guildId },
-          { $inc: { [`scores.${target.id}`]: -points } }
+          { $inc: { [`scores.${target.id}`]: -points } },
+          { upsert: true }
         );
 
         await interaction.reply({ content: `✅ 已減少 ${target.username} 的 ${points} 分` });
