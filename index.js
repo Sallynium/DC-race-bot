@@ -16,15 +16,11 @@ const MONGO_URI = process.env["MONGO_URI"];
 
 // ── Mongoose Schema ────────────────────────────────────────────────────────────
 
-const predictionMapSchema = new mongoose.Schema(
-  { type: Map, of: String },
-  { _id: false },
-);
-
 const guildSchema = new mongoose.Schema({
   guildId: { type: String, required: true, unique: true },
-  // matchId -> userId -> teamName
-  predictions: { type: Map, of: predictionMapSchema, default: () => new Map() },
+  // MongoDB 巢狀結構建議直接用混合型別或物件，配合原子操作最穩定
+  // 結構：matchId -> userId -> teamName
+  predictions: { type: Map, of: mongoose.Schema.Types.Mixed, default: () => new Map() },
   // userId -> score
   scores: { type: Map, of: Number, default: () => new Map() },
   // matchId -> winningTeam
@@ -61,12 +57,8 @@ const commands = [
   new SlashCommandBuilder()
     .setName("predict")
     .setDescription("預測比賽贏家")
-    .addStringOption((o) =>
-      o.setName("比賽id").setDescription("輸入比賽ID（例如：R1）").setRequired(true).setAutocomplete(true),
-    )
-    .addStringOption((o) =>
-      o.setName("隊伍").setDescription("輸入預測獲勝的隊伍名稱").setRequired(true).setAutocomplete(true),
-    ),
+    .addStringOption((o) => o.setName("比賽id").setDescription("輸入比賽ID（例如：R1）").setRequired(true).setAutocomplete(true))
+    .addStringOption((o) => o.setName("隊伍").setDescription("輸入預測獲勝的隊伍名稱").setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder()
     .setName("register")
@@ -84,27 +76,18 @@ const commands = [
     .setName("result")
     .setDescription("【管理員】登錄比賽結果")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption((o) =>
-      o.setName("比賽id").setDescription("比賽ID").setRequired(true).setAutocomplete(true),
-    )
-    .addStringOption((o) =>
-      o.setName("勝隊").setDescription("獲勝隊伍名稱").setRequired(true).setAutocomplete(true),
-    ),
+    .addStringOption((o) => o.setName("比賽id").setDescription("比賽ID").setRequired(true).setAutocomplete(true))
+    .addStringOption((o) => o.setName("勝隊").setDescription("獲勝隊伍名稱").setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder().setName("matches").setDescription("查看所有已登錄的比賽"),
-
   new SlashCommandBuilder().setName("myscore").setDescription("查看自己的目前總積分"),
-
   new SlashCommandBuilder().setName("leaderboard").setDescription("查看積分排行榜"),
-
   new SlashCommandBuilder().setName("mypredictions").setDescription("查看自己的所有預測紀錄"),
 
   new SlashCommandBuilder()
     .setName("history")
     .setDescription("查看某場比賽的預測統計")
-    .addStringOption((o) =>
-      o.setName("比賽id").setDescription("比賽ID").setRequired(true).setAutocomplete(true),
-    ),
+    .addStringOption((o) => o.setName("比賽id").setDescription("比賽ID").setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder()
     .setName("follow")
@@ -115,17 +98,13 @@ const commands = [
     .setName("delete")
     .setDescription("【管理員】刪除比賽及其所有相關資料")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption((o) =>
-      o.setName("比賽id").setDescription("要刪除的比賽ID").setRequired(true).setAutocomplete(true),
-    ),
+    .addStringOption((o) => o.setName("比賽id").setDescription("要刪除的比賽ID").setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder()
     .setName("undoresult")
     .setDescription("【管理員】回溯比賽結果")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption((o) =>
-      o.setName("比賽id").setDescription("要回溯的比賽ID").setRequired(true).setAutocomplete(true),
-    ),
+    .addStringOption((o) => o.setName("比賽id").setDescription("要回溯的比賽ID").setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder()
     .setName("addscore")
@@ -146,23 +125,16 @@ const commands = [
     .setDescription("【管理員】代替使用者進行預測")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption((o) => o.setName("使用者").setDescription("選擇使用者").setRequired(true))
-    .addStringOption((o) =>
-      o.setName("比賽id").setDescription("比賽ID").setRequired(true).setAutocomplete(true),
-    )
-    .addStringOption((o) =>
-      o.setName("隊伍").setDescription("預測隊伍").setRequired(true).setAutocomplete(true),
-    ),
+    .addStringOption((o) => o.setName("比賽id").setDescription("比賽ID").setRequired(true).setAutocomplete(true))
+    .addStringOption((o) => o.setName("隊伍").setDescription("預測隊伍").setRequired(true).setAutocomplete(true)),
 
   new SlashCommandBuilder()
     .setName("resetall")
     .setDescription("【管理員】清空所有資料（需二次確認）")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addBooleanOption((o) =>
-      o.setName("確認").setDescription("確認要清空所有資料？此操作無法復原！").setRequired(true),
-    ),
+    .addBooleanOption((o) => o.setName("確認").setDescription("確認要清空所有資料？此操作無法復原！").setRequired(true)),
 
   new SlashCommandBuilder().setName("help").setDescription("顯示機器人使用說明"),
-
   new SlashCommandBuilder().setName("食物輪盤").setDescription("隨機決定今天要吃什麼！"),
 ];
 
@@ -190,7 +162,6 @@ client.on("interactionCreate", async (interaction) => {
   const focusedOption = interaction.options.getFocused(true);
 
   try {
-    // 只撈需要的欄位，降低延遲
     const doc = await GuildData.findOne({ guildId }, "match_teams match_history").lean();
     if (!doc) return interaction.respond([]);
 
@@ -217,7 +188,7 @@ client.on("interactionCreate", async (interaction) => {
       });
 
       await interaction.respond(choices);
-    } else if (focusedOption.name === "隊伍") {
+    } else if (focusedOption.name === "隊伍" || focusedOption.name === "勝隊") {
       const matchId = interaction.options.getString("比賽id")?.toUpperCase();
       const teams = matchId && matchTeams[matchId];
       if (Array.isArray(teams)) {
@@ -225,14 +196,6 @@ client.on("interactionCreate", async (interaction) => {
           .filter((t) => t.toLowerCase().includes(searchValue))
           .map((t) => ({ name: t, value: t }));
         await interaction.respond(choices);
-      } else {
-        await interaction.respond([]);
-      }
-    } else if (focusedOption.name === "勝隊") {
-      const matchId = interaction.options.getString("比賽id")?.toUpperCase();
-      const teams = matchId && matchTeams[matchId];
-      if (Array.isArray(teams)) {
-        await interaction.respond(teams.map((t) => ({ name: t, value: t })));
       } else {
         await interaction.respond([]);
       }
@@ -283,12 +246,11 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
-        // 取出或建立該場比賽的預測 Map
-        const matchPredictions = doc.predictions.get(matchId) || new Map();
-        matchPredictions.set(interaction.user.id, predictedTeam);
-        doc.predictions.set(matchId, matchPredictions);
-        doc.markModified("predictions");
-        await doc.save();
+        // 原子操作 $set，避免 doc.save() 造成的併發覆蓋
+        await GuildData.updateOne(
+          { guildId },
+          { $set: { [`predictions.${matchId}.${interaction.user.id}`]: predictedTeam } }
+        );
 
         await interaction.reply({ content: `✅ 你預測 \`${matchId}\` 比賽的贏家為：\`${predictedTeam}\`` });
         break;
@@ -320,13 +282,16 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
-        doc.match_teams.set(matchId, [teamA, teamB]);
-        doc.match_schedules.set(matchId, taipeiTime.toISOString());
-        doc.match_points.set(matchId, point);
-        doc.markModified("match_teams");
-        doc.markModified("match_schedules");
-        doc.markModified("match_points");
-        await doc.save();
+        await GuildData.updateOne(
+          { guildId },
+          {
+            $set: {
+              [`match_teams.${matchId}`]: [teamA, teamB],
+              [`match_schedules.${matchId}`]: taipeiTime.toISOString(),
+              [`match_points.${matchId}`]: point
+            }
+          }
+        );
 
         await interaction.reply({
           content: `${hasForce ? "🔄 已覆蓋原有資料，" : ""}✅ 登錄比賽 \`${matchId}\`：${teamA} vs ${teamB}，時間：${taipeiTime.toLocaleString("zh-TW", { timeZone: "Asia/Taipei" })}（預測正確得 ${point} 分）`,
@@ -362,19 +327,21 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
-        doc.match_history.set(matchId, winningTeam);
         const point = doc.match_points.get(matchId) || 1;
-        const matchPredictions = doc.predictions.get(matchId) || new Map();
+        const matchPredictions = doc.predictions.get(matchId);
+        const rawPredictions = matchPredictions instanceof Map
+          ? Object.fromEntries(matchPredictions)
+          : (matchPredictions || {});
 
-        for (const [userId, team] of matchPredictions) {
+        const updateOps = { [`match_history.${matchId}`]: winningTeam };
+
+        for (const [userId, team] of Object.entries(rawPredictions)) {
           if (team.toUpperCase() === winningTeam) {
-            doc.scores.set(userId, (doc.scores.get(userId) || 0) + point);
+            updateOps[`scores.${userId}`] = (doc.scores.get(userId) || 0) + point;
           }
         }
 
-        doc.markModified("match_history");
-        doc.markModified("scores");
-        await doc.save();
+        await GuildData.updateOne({ guildId }, { $set: updateOps });
 
         await interaction.reply({ content: `✅ 比賽 \`${matchId}\` 的勝隊是 \`${winningTeam}\`，積分已更新！` });
         break;
@@ -458,9 +425,10 @@ client.on("interactionCreate", async (interaction) => {
         const myList = [];
 
         for (const [matchId, matchPredictions] of doc.predictions) {
-          const team = matchPredictions instanceof Map
-            ? matchPredictions.get(userId)
-            : matchPredictions?.[userId];
+          const rawPredictions = matchPredictions instanceof Map
+            ? Object.fromEntries(matchPredictions)
+            : matchPredictions;
+          const team = rawPredictions?.[userId];
           if (team) myList.push({ matchId, team });
         }
 
@@ -489,8 +457,12 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
+        const rawPredictions = matchPredictions instanceof Map
+          ? Object.fromEntries(matchPredictions)
+          : matchPredictions;
+
         const count = {};
-        for (const [, team] of matchPredictions) {
+        for (const team of Object.values(rawPredictions)) {
           const t = team.toUpperCase();
           count[t] = (count[t] || 0) + 1;
         }
@@ -515,6 +487,7 @@ client.on("interactionCreate", async (interaction) => {
 
         const doc = await getServerData(guildId);
         const now = new Date();
+        const updateOps = {};
         const followed = [];
         const skipped = [];
         const alreadyPredicted = [];
@@ -523,27 +496,23 @@ client.on("interactionCreate", async (interaction) => {
           const deadline = new Date(doc.match_schedules.get(matchId));
           if (now > deadline) continue;
 
-          const matchPredictions = doc.predictions.get(matchId) || new Map();
-          const targetTeam = matchPredictions instanceof Map
-            ? matchPredictions.get(targetId)
-            : matchPredictions?.[targetId];
+          const matchPredictions = doc.predictions.get(matchId);
+          const rawPredictions = matchPredictions instanceof Map
+            ? Object.fromEntries(matchPredictions)
+            : (matchPredictions || {});
 
+          const targetTeam = rawPredictions[targetId];
           if (!targetTeam) { skipped.push(matchId); continue; }
 
-          const myTeam = matchPredictions instanceof Map
-            ? matchPredictions.get(userId)
-            : matchPredictions?.[userId];
+          if (rawPredictions[userId]) { alreadyPredicted.push(matchId); continue; }
 
-          if (myTeam) { alreadyPredicted.push(matchId); continue; }
-
-          const updated = matchPredictions instanceof Map ? matchPredictions : new Map(Object.entries(matchPredictions));
-          updated.set(userId, targetTeam);
-          doc.predictions.set(matchId, updated);
+          updateOps[`predictions.${matchId}.${userId}`] = targetTeam;
           followed.push(`${matchId}：${targetTeam}`);
         }
 
-        doc.markModified("predictions");
-        await doc.save();
+        if (Object.keys(updateOps).length > 0) {
+          await GuildData.updateOne({ guildId }, { $set: updateOps });
+        }
 
         let msg = `📋 成功跟單 ${targetUser.username} 的預測如下：\n`;
         if (followed.length > 0) msg += `✅ ${followed.join("\n")}\n`;
@@ -565,17 +534,18 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
-        doc.match_teams.delete(matchId);
-        doc.match_schedules.delete(matchId);
-        doc.match_points.delete(matchId);
-        doc.predictions.delete(matchId);
-        doc.match_history.delete(matchId);
-        doc.markModified("match_teams");
-        doc.markModified("match_schedules");
-        doc.markModified("match_points");
-        doc.markModified("predictions");
-        doc.markModified("match_history");
-        await doc.save();
+        await GuildData.updateOne(
+          { guildId },
+          {
+            $unset: {
+              [`match_teams.${matchId}`]: "",
+              [`match_schedules.${matchId}`]: "",
+              [`match_points.${matchId}`]: "",
+              [`predictions.${matchId}`]: "",
+              [`match_history.${matchId}`]: ""
+            }
+          }
+        );
 
         await interaction.reply({ content: `🗑️ 已刪除比賽 \`${matchId}\` 的所有紀錄。` });
         break;
@@ -594,20 +564,28 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         const point = doc.match_points.get(matchId) || 1;
-        const matchPredictions = doc.predictions.get(matchId) || new Map();
-        let undoCount = 0;
+        const matchPredictions = doc.predictions.get(matchId);
+        const rawPredictions = matchPredictions instanceof Map
+          ? Object.fromEntries(matchPredictions)
+          : (matchPredictions || {});
 
-        for (const [userId, team] of matchPredictions) {
+        let undoCount = 0;
+        const updateOps = {};
+
+        for (const [userId, team] of Object.entries(rawPredictions)) {
           if (team.toUpperCase() === winner.toUpperCase()) {
-            doc.scores.set(userId, (doc.scores.get(userId) || 0) - point);
+            updateOps[`scores.${userId}`] = (doc.scores.get(userId) || 0) - point;
             undoCount++;
           }
         }
 
-        doc.match_history.delete(matchId);
-        doc.markModified("match_history");
-        doc.markModified("scores");
-        await doc.save();
+        await GuildData.updateOne(
+          { guildId },
+          {
+            $set: updateOps,
+            $unset: { [`match_history.${matchId}`]: "" }
+          }
+        );
 
         await interaction.reply({
           content: `🔄 已回溯比賽 \`${matchId}\` 結果，扣除 ${undoCount} 名預測 \`${winner}\` 使用者的 ${point} 分，請重新使用 \`/result\` 結算。`,
@@ -620,9 +598,10 @@ client.on("interactionCreate", async (interaction) => {
         const points = interaction.options.getInteger("分數");
         const doc = await getServerData(guildId);
 
-        doc.scores.set(target.id, (doc.scores.get(target.id) || 0) + points);
-        doc.markModified("scores");
-        await doc.save();
+        await GuildData.updateOne(
+          { guildId },
+          { $set: { [`scores.${target.id}`]: (doc.scores.get(target.id) || 0) + points } }
+        );
 
         await interaction.reply({ content: `✅ 已增加 ${target.username} 的 ${points} 分` });
         break;
@@ -633,9 +612,10 @@ client.on("interactionCreate", async (interaction) => {
         const points = interaction.options.getInteger("分數");
         const doc = await getServerData(guildId);
 
-        doc.scores.set(target.id, (doc.scores.get(target.id) || 0) - points);
-        doc.markModified("scores");
-        await doc.save();
+        await GuildData.updateOne(
+          { guildId },
+          { $set: { [`scores.${target.id}`]: (doc.scores.get(target.id) || 0) - points } }
+        );
 
         await interaction.reply({ content: `✅ 已減少 ${target.username} 的 ${points} 分` });
         break;
@@ -662,12 +642,10 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
-        const matchPredictions = doc.predictions.get(matchId) || new Map();
-        const updated = matchPredictions instanceof Map ? matchPredictions : new Map(Object.entries(matchPredictions));
-        updated.set(target.id, predictedTeam);
-        doc.predictions.set(matchId, updated);
-        doc.markModified("predictions");
-        await doc.save();
+        await GuildData.updateOne(
+          { guildId },
+          { $set: { [`predictions.${matchId}.${target.id}`]: predictedTeam } }
+        );
 
         await interaction.reply({ content: `✅ 成功為 ${target.username} 設定 \`${matchId}\` 預測為 \`${predictedTeam}\`` });
         break;
