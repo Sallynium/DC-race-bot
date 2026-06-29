@@ -532,12 +532,18 @@ client.on("interactionCreate", async (interaction) => {
         const alreadyPredicted = [];
 
         for (const [matchId] of doc.match_teams) {
-          // 已結算、無排程、排程無效、或已截止的場次都跳過（fail-closed）
+          // 已結算的場次直接跳過（fail-closed）
+          if (doc.match_history.get(matchId)) continue;
+
+          // 排程缺失或損毀屬於資料異常（register 正常一定會寫排程），記 log 方便除錯；
+          // 單純已截止（now > deadline）是常態，不記 log 以免洗版。
           const scheduleStr = doc.match_schedules.get(matchId);
           const deadline = new Date(scheduleStr);
-          if (doc.match_history.get(matchId) || !scheduleStr || isNaN(deadline.getTime()) || now > deadline) {
+          if (!scheduleStr || isNaN(deadline.getTime())) {
+            console.warn(`[follow] 略過比賽 ${matchId}：排程缺失或無效（guild=${guildId}, schedule=${scheduleStr}）`);
             continue;
           }
+          if (now > deadline) continue;
 
           const matchPredictions = doc.predictions.get(matchId);
           const rawPredictions = matchPredictions instanceof Map
