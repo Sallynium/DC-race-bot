@@ -265,6 +265,13 @@ client.on("interactionCreate", async (interaction) => {
         const point = interaction.options.getInteger("分數") || 1;
         const hasForce = interaction.options.getBoolean("強制覆蓋") || false;
 
+        if (matchId.includes(".")) {
+          return interaction.reply({
+            content: "❌ 比賽ID 不可包含 `.` 字元，請重新輸入。",
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
         const taipeiTime = new Date(`${datePart}T${timePart}+08:00`);
         if (isNaN(taipeiTime.getTime())) {
           return interaction.reply({
@@ -333,15 +340,21 @@ client.on("interactionCreate", async (interaction) => {
           ? Object.fromEntries(matchPredictions)
           : (matchPredictions || {});
 
-        const updateOps = { [`match_history.${matchId}`]: winningTeam };
+        const incOps = {};
 
         for (const [userId, team] of Object.entries(rawPredictions)) {
-          if (team.toUpperCase() === winningTeam) {
-            updateOps[`scores.${userId}`] = (doc.scores.get(userId) || 0) + point;
+          if (typeof team === "string" && team.toUpperCase() === winningTeam) {
+            incOps[`scores.${userId}`] = point;
           }
         }
 
-        await GuildData.updateOne({ guildId }, { $set: updateOps });
+        await GuildData.updateOne(
+          { guildId },
+          {
+            $set: { [`match_history.${matchId}`]: winningTeam },
+            ...(Object.keys(incOps).length > 0 && { $inc: incOps }),
+          }
+        );
 
         await interaction.reply({ content: `✅ 比賽 \`${matchId}\` 的勝隊是 \`${winningTeam}\`，積分已更新！` });
         break;
@@ -570,11 +583,11 @@ client.on("interactionCreate", async (interaction) => {
           : (matchPredictions || {});
 
         let undoCount = 0;
-        const updateOps = {};
+        const incOps = {};
 
         for (const [userId, team] of Object.entries(rawPredictions)) {
-          if (team.toUpperCase() === winner.toUpperCase()) {
-            updateOps[`scores.${userId}`] = (doc.scores.get(userId) || 0) - point;
+          if (typeof team === "string" && team.toUpperCase() === winner.toUpperCase()) {
+            incOps[`scores.${userId}`] = -point;
             undoCount++;
           }
         }
@@ -582,8 +595,8 @@ client.on("interactionCreate", async (interaction) => {
         await GuildData.updateOne(
           { guildId },
           {
-            $set: updateOps,
-            $unset: { [`match_history.${matchId}`]: "" }
+            $unset: { [`match_history.${matchId}`]: "" },
+            ...(Object.keys(incOps).length > 0 && { $inc: incOps }),
           }
         );
 
@@ -600,7 +613,7 @@ client.on("interactionCreate", async (interaction) => {
 
         await GuildData.updateOne(
           { guildId },
-          { $set: { [`scores.${target.id}`]: (doc.scores.get(target.id) || 0) + points } }
+          { $inc: { [`scores.${target.id}`]: points } }
         );
 
         await interaction.reply({ content: `✅ 已增加 ${target.username} 的 ${points} 分` });
@@ -614,7 +627,7 @@ client.on("interactionCreate", async (interaction) => {
 
         await GuildData.updateOne(
           { guildId },
-          { $set: { [`scores.${target.id}`]: (doc.scores.get(target.id) || 0) - points } }
+          { $inc: { [`scores.${target.id}`]: -points } }
         );
 
         await interaction.reply({ content: `✅ 已減少 ${target.username} 的 ${points} 分` });
