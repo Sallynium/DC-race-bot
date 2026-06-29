@@ -1,0 +1,13 @@
+{
+  "name": "dc-race-bot",
+  "version": "1.0.0",
+  "description": "Discord 賽事預測機器人",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "express": "^4.18.2"
+  }
+}

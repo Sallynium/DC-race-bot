@@ -1,0 +1,1211 @@
+// 引入必要模組
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  SlashCommandBuilder,
+  REST,
+  Routes,
+  PermissionFlagsBits,
+  MessageFlags,
+} = require("discord.js");
+const fs = require("fs");
+
+// 從 Replit 的環境變數取得 TOKEN
+const TOKEN = process.env["TOKEN"];
+const CLIENT_ID = process.env["CLIENT_ID"]; // 需要在 Replit Secrets 中新增
+const DATA_FILE = "./predictions_data.json";
+
+// 建立 Discord 客戶端
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+});
+
+// 資料結構初始化
+let data = {};
+
+// 載入資料
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const content = fs.readFileSync(DATA_FILE, "utf8");
+      data = JSON.parse(content);
+
+      // 修補缺失欄位（避免舊資料缺欄位）
+      for (const guildId in data) {
+        // 確保是有效的伺服器資料物件
+        if (
+          typeof data[guildId] !== "object" ||
+          data[guildId] === null ||
+          Array.isArray(data[guildId])
+        ) {
+          console.log(`⚠️ 偵測到無效資料鍵：${guildId}，已刪除`);
+          delete data[guildId];
+          continue;
+        }
+
+        // 檢查是否為內部欄位
+        const validFields = [
+          "predictions",
+          "scores",
+          "match_history",
+          "match_schedules",
+          "match_teams",
+          "match_points",
+        ];
+        if (validFields.includes(guildId)) {
+          console.log(`⚠️ 偵測到錯誤的根層級欄位：${guildId}，已刪除`);
+          delete data[guildId];
+          continue;
+        }
+
+        // 初始化缺失的欄位
+        data[guildId].predictions ??= {};
+        data[guildId].scores ??= {};
+        data[guildId].match_history ??= {};
+        data[guildId].match_schedules ??= {};
+        data[guildId].match_teams ??= {};
+        data[guildId].match_points ??= {};
+
+        // 清理內部的錯誤資料
+        for (const field of validFields) {
+          if (
+            data[guildId][field] &&
+            typeof data[guildId][field] === "object"
+          ) {
+            for (const key in data[guildId][field]) {
+              if (validFields.includes(key)) {
+                console.log(`⚠️ 清理 ${guildId}.${field} 內的錯誤欄位：${key}`);
+                delete data[guildId][field][key];
+              }
+            }
+          }
+        }
+
+        // 移除 1A2B 殘留資料
+        if (data[guildId]["1a2b_session"]) delete data[guildId]["1a2b_session"];
+        if (data[guildId]["1a2b_sessions"])
+          delete data[guildId]["1a2b_sessions"];
+      }
+
+      console.log("✅ 成功載入預測資料！");
+    }
+  } catch (err) {
+    console.error("❌ 載入資料錯誤:", err);
+  }
+}
+
+// 儲存資料
+function saveData() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf8");
+    console.log("💾 資料已儲存。");
+  } catch (err) {
+    console.error("❌ 儲存資料錯誤:", err);
+  }
+}
+
+// 定義斜線指令
+const commands = [
+  new SlashCommandBuilder()
+    .setName("predict")
+    .setDescription("預測比賽贏家")
+    .addStringOption((option) =>
+      option
+        .setName("比賽id")
+        .setDescription("輸入比賽ID（例如：R1）")
+        .setRequired(true)
+        .setAutocomplete(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("隊伍")
+        .setDescription("輸入預測獲勝的隊伍名稱")
+        .setRequired(true)
+        .setAutocomplete(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("register")
+    .setDescription("【管理員】登錄新比賽")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption((option) =>
+      option
+        .setName("比賽id")
+        .setDescription("比賽ID（例如：R1）")
+        .setRequired(true),
+    )
+    .addStringOption((option) =>
+      option.setName("隊伍a").setDescription("隊伍A名稱").setRequired(true),
+    )
+    .addStringOption((option) =>
+      option.setName("隊伍b").setDescription("隊伍B名稱").setRequired(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("日期")
+        .setDescription("比賽日期（格式：YYYY-MM-DD）")
+        .setRequired(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("時間")
+        .setDescription("比賽時間（格式：HH:MM，台北時間）")
+        .setRequired(true),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName("分數")
+        .setDescription("預測正確可得分數（預設為1分）")
+        .setMinValue(1),
+    )
+    .addBooleanOption((option) =>
+      option.setName("強制覆蓋").setDescription("是否強制覆蓋已存在的比賽"),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("result")
+    .setDescription("【管理員】登錄比賽結果")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption((option) =>
+      option
+        .setName("比賽id")
+        .setDescription("比賽ID")
+        .setRequired(true)
+        .setAutocomplete(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("勝隊")
+        .setDescription("獲勝隊伍名稱")
+        .setRequired(true)
+        .setAutocomplete(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("matches")
+    .setDescription("查看所有已登錄的比賽"),
+
+  new SlashCommandBuilder()
+    .setName("myscore")
+    .setDescription("查看自己的目前總積分"),
+
+  new SlashCommandBuilder()
+    .setName("leaderboard")
+    .setDescription("查看積分排行榜"),
+
+  new SlashCommandBuilder()
+    .setName("mypredictions")
+    .setDescription("查看自己的所有預測紀錄"),
+
+  new SlashCommandBuilder()
+    .setName("history")
+    .setDescription("查看某場比賽的預測統計")
+    .addStringOption((option) =>
+      option
+        .setName("比賽id")
+        .setDescription("比賽ID")
+        .setRequired(true)
+        .setAutocomplete(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("follow")
+    .setDescription("複製其他使用者的預測（跟單）")
+    .addUserOption((option) =>
+      option
+        .setName("使用者")
+        .setDescription("選擇要跟單的使用者")
+        .setRequired(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("delete")
+    .setDescription("【管理員】刪除比賽及其所有相關資料")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption((option) =>
+      option
+        .setName("比賽id")
+        .setDescription("要刪除的比賽ID")
+        .setRequired(true)
+        .setAutocomplete(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("undoresult")
+    .setDescription("【管理員】回溯比賽結果")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption((option) =>
+      option
+        .setName("比賽id")
+        .setDescription("要回溯的比賽ID")
+        .setRequired(true)
+        .setAutocomplete(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("addscore")
+    .setDescription("【管理員】手動增加使用者積分")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addUserOption((option) =>
+      option.setName("使用者").setDescription("選擇使用者").setRequired(true),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName("分數")
+        .setDescription("要增加的分數")
+        .setRequired(true)
+        .setMinValue(1),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("subscore")
+    .setDescription("【管理員】手動減少使用者積分")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addUserOption((option) =>
+      option.setName("使用者").setDescription("選擇使用者").setRequired(true),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName("分數")
+        .setDescription("要減少的分數")
+        .setRequired(true)
+        .setMinValue(1),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("forcepredict")
+    .setDescription("【管理員】代替使用者進行預測")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addUserOption((option) =>
+      option.setName("使用者").setDescription("選擇使用者").setRequired(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("比賽id")
+        .setDescription("比賽ID")
+        .setRequired(true)
+        .setAutocomplete(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName("隊伍")
+        .setDescription("預測隊伍")
+        .setRequired(true)
+        .setAutocomplete(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("resetall")
+    .setDescription("【管理員】清空所有資料（需二次確認）")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addBooleanOption((option) =>
+      option
+        .setName("確認")
+        .setDescription("確認要清空所有資料？此操作無法復原！")
+        .setRequired(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName("help")
+    .setDescription("顯示機器人使用說明"),
+
+  new SlashCommandBuilder()
+    .setName("食物輪盤")
+    .setDescription("隨機決定今天要吃什麼！"),
+];
+
+// 註冊斜線指令
+async function registerCommands() {
+  try {
+    console.log("開始註冊斜線指令...");
+    const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+    await rest.put(Routes.applicationCommands(CLIENT_ID), {
+      body: commands.map((cmd) => cmd.toJSON()),
+    });
+
+    console.log("✅ 成功註冊所有斜線指令！");
+  } catch (error) {
+    console.error("❌ 註冊斜線指令失敗:", error);
+  }
+}
+
+client.on("ready", async () => {
+  console.log(`🤖 機器人上線：${client.user.tag}`);
+  loadData();
+  await registerCommands();
+});
+
+// 處理自動完成
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isAutocomplete()) return;
+
+  const guildId = interaction.guildId;
+  if (!guildId || !data[guildId]) return;
+
+  const serverData = data[guildId];
+  const focusedOption = interaction.options.getFocused(true);
+
+  try {
+    if (focusedOption.name === "比賽id") {
+      // 自動完成：比賽ID列表
+      const commandName = interaction.commandName;
+      const searchValue = focusedOption.value.toLowerCase();
+      const matchHistory = serverData.match_history || {};
+      const matchTeams = serverData.match_teams || {};
+
+      // 快速過濾比賽
+      const allMatches = Object.keys(matchTeams);
+      let matches;
+
+      // 根據不同指令過濾比賽
+      if (
+        commandName === "predict" ||
+        commandName === "forcepredict" ||
+        commandName === "result"
+      ) {
+        // 只顯示尚未結算的比賽
+        matches = allMatches.filter(
+          (id) => !matchHistory[id] && id.toLowerCase().includes(searchValue),
+        );
+      } else if (commandName === "undoresult") {
+        // 只顯示已結算的比賽
+        matches = allMatches.filter(
+          (id) => matchHistory[id] && id.toLowerCase().includes(searchValue),
+        );
+      } else {
+        // 其他指令 - 顯示所有比賽
+        matches = allMatches.filter((id) =>
+          id.toLowerCase().includes(searchValue),
+        );
+      }
+
+      // 限制最多25個選項並生成選項列表
+      const choices = matches.slice(0, 25).map((id) => {
+        const teams = matchTeams[id]?.join(" vs ") || "未知";
+        return { name: `${id} (${teams})`, value: id };
+      });
+
+      await interaction.respond(choices);
+    } else if (focusedOption.name === "隊伍") {
+      // 自動完成：隊伍名稱（根據選擇的比賽ID）
+      const matchId = interaction.options.getString("比賽id")?.toUpperCase();
+      const matchTeams = serverData.match_teams || {};
+
+      if (matchId && matchTeams[matchId]) {
+        const teams = matchTeams[matchId];
+        const searchValue = focusedOption.value.toLowerCase();
+        const choices = teams
+          .filter((team) => team.toLowerCase().includes(searchValue))
+          .map((team) => ({ name: team, value: team }));
+
+        await interaction.respond(choices);
+      } else {
+        await interaction.respond([]);
+      }
+    } else if (focusedOption.name === "勝隊") {
+      // 自動完成：勝隊（根據比賽ID）
+      const matchId = interaction.options.getString("比賽id")?.toUpperCase();
+      const matchTeams = serverData.match_teams || {};
+
+      if (matchId && matchTeams[matchId]) {
+        const choices = matchTeams[matchId].map((team) => ({
+          name: team,
+          value: team,
+        }));
+        await interaction.respond(choices);
+      } else {
+        await interaction.respond([]);
+      }
+    }
+  } catch (error) {
+    console.error("自動完成錯誤:", error);
+    // 發生錯誤時回傳空陣列，避免 crash
+    try {
+      await interaction.respond([]);
+    } catch (e) {
+      // 如果連 respond 都失敗，就忽略（可能已經 timeout）
+    }
+  }
+});
+
+// 處理斜線指令
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const guildId = interaction.guildId;
+  if (!guildId) return;
+
+  // 初始化伺服器資料
+  if (!data[guildId]) {
+    data[guildId] = {
+      predictions: {},
+      scores: {},
+      match_history: {},
+      match_schedules: {},
+      match_teams: {},
+      match_points: {},
+    };
+  }
+  const serverData = data[guildId];
+
+  try {
+    switch (interaction.commandName) {
+      case "predict": {
+        const matchId = interaction.options.getString("比賽id").toUpperCase();
+        const predictedTeam = interaction.options
+          .getString("隊伍")
+          .toUpperCase();
+
+        if (!serverData.match_teams[matchId]) {
+          return interaction.reply({
+            content: `❌ 預測失敗，找不到比賽 \`${matchId}\`，請確認比賽是否已登錄。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        const validTeams = serverData.match_teams[matchId];
+        if (!validTeams.includes(predictedTeam)) {
+          return interaction.reply({
+            content: `❌ 預測失敗，請確認隊伍名稱是否為 ${validTeams.join(" 或 ")}。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        const now = new Date();
+        const startTime = serverData.match_schedules[matchId]
+          ? new Date(serverData.match_schedules[matchId])
+          : null;
+
+        if (startTime && now >= startTime) {
+          return interaction.reply({
+            content: `⏰ 比賽 \`${matchId}\` 已開始，無法再預測！`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        if (!serverData.predictions[matchId]) {
+          serverData.predictions[matchId] = {};
+        }
+        serverData.predictions[matchId][interaction.user.id] = predictedTeam;
+        saveData();
+
+        await interaction.reply({
+          content: `✅ 你預測 \`${matchId}\` 比賽的贏家為：\`${predictedTeam}\``,
+        });
+        break;
+      }
+
+      case "register": {
+        const matchId = interaction.options.getString("比賽id").toUpperCase();
+        const teamA = interaction.options.getString("隊伍a").toUpperCase();
+        const teamB = interaction.options.getString("隊伍b").toUpperCase();
+        const datePart = interaction.options.getString("日期");
+        const timePart = interaction.options.getString("時間");
+        const point = interaction.options.getInteger("分數") || 1;
+        const hasForce = interaction.options.getBoolean("強制覆蓋") || false;
+
+        const taipeiTime = new Date(`${datePart}T${timePart}+08:00`);
+        if (isNaN(taipeiTime.getTime())) {
+          return interaction.reply({
+            content: "❌ 時間格式錯誤，請使用 YYYY-MM-DD HH:MM 台北時間格式。",
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        if (serverData.match_teams[matchId] && !hasForce) {
+          return interaction.reply({
+            content: `⚠️ 比賽 \`${matchId}\` 已經存在，若要覆蓋請將「強制覆蓋」選項設為 True`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        serverData.match_points[matchId] = point;
+        serverData.match_teams[matchId] = [teamA, teamB];
+        serverData.match_schedules[matchId] = taipeiTime.toISOString();
+        saveData();
+
+        await interaction.reply({
+          content: `${hasForce ? "🔄 已覆蓋原有資料，" : ""}✅ 登錄比賽 \`${matchId}\`：${teamA} vs ${teamB}，時間：${taipeiTime.toLocaleString("zh-TW", { timeZone: "Asia/Taipei" })}（預測正確得 ${point} 分）`,
+        });
+        break;
+      }
+
+      case "result": {
+        const matchId = interaction.options.getString("比賽id").toUpperCase();
+        const winningTeam = interaction.options.getString("勝隊").toUpperCase();
+
+        if (!serverData.match_teams[matchId]) {
+          return interaction.reply({
+            content: `❌ 查無比賽 \`${matchId}\`，請確認是否正確輸入。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        const validTeams = serverData.match_teams[matchId];
+        if (!validTeams.includes(winningTeam)) {
+          return interaction.reply({
+            content: `❌ 結果輸入錯誤：勝隊 \`${winningTeam}\` 並不屬於比賽 \`${matchId}\` 的登錄隊伍。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        if (serverData.match_history[matchId]) {
+          return interaction.reply({
+            content: `⚠️ 比賽 \`${matchId}\` 已結算過，若需要修正請使用 \`/undoresult\` 回溯。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        serverData.match_history[matchId] = winningTeam;
+        const predictions = serverData.predictions[matchId] || {};
+
+        for (const userId in predictions) {
+          const point = serverData.match_points[matchId] || 1;
+          if (predictions[userId].toUpperCase() === winningTeam) {
+            serverData.scores[userId] =
+              (serverData.scores[userId] || 0) + point;
+          }
+        }
+        saveData();
+
+        await interaction.reply({
+          content: `✅ 比賽 \`${matchId}\` 的勝隊是 \`${winningTeam}\`，積分已更新！`,
+        });
+        break;
+      }
+
+      case "matches": {
+        const now = new Date();
+        const upcoming = [];
+        const ongoing = [];
+        const finished = [];
+
+        for (const matchId in serverData.match_schedules) {
+          const start = new Date(serverData.match_schedules[matchId]);
+          const teams =
+            serverData.match_teams[matchId]?.join(" vs ") || "未知對戰組合";
+          const point = serverData.match_points[matchId] || 1;
+          const timeStr = start.toLocaleString("zh-TW", {
+            timeZone: "Asia/Taipei",
+          });
+          const isResolved = serverData.match_history[matchId];
+          const line = `\`${matchId}\`｜${teams}｜${timeStr}｜${point} 分`;
+
+          if (isResolved) {
+            // 已結算的比賽
+            finished.push(matchId);
+          } else if (now < start) {
+            // 尚未開始，可預測
+            upcoming.push(line);
+          } else {
+            // 已開始但未結算
+            ongoing.push(line);
+          }
+        }
+
+        let msg = "**📅 比賽狀態總覽：**\n";
+
+        // 可預測的比賽
+        if (upcoming.length > 0) {
+          msg += "\n🔮 **可預測比賽：**\n" + upcoming.join("\n") + "\n";
+        } else {
+          msg += "\n🔮 **可預測比賽：** 無\n";
+        }
+
+        // 進行中但未結算
+        if (ongoing.length > 0) {
+          msg += "\n⏰ **進行中（無法預測）：**\n" + ongoing.join("\n") + "\n";
+        }
+
+        // 已結算的比賽（收合顯示）
+        if (finished.length > 0) {
+          msg += `\n✅ **已結算比賽：** ${finished.length} 場`;
+          msg += `\n（${finished.slice(0, 5).join(", ")}${finished.length > 5 ? "..." : ""}）`;
+        }
+
+        await interaction.reply({ content: msg });
+        break;
+      }
+
+      case "myscore": {
+        const score = serverData.scores[interaction.user.id] || 0;
+        await interaction.reply({
+          content: `🎯 你的目前總積分為：${score} 分`,
+          flags: [MessageFlags.Ephemeral],
+        });
+        break;
+      }
+
+      case "leaderboard": {
+        // 先回應 Discord，避免 3 秒 timeout
+        await interaction.deferReply();
+
+        const sorted = Object.entries(serverData.scores).sort(
+          ([, a], [, b]) => b - a,
+        );
+        let msg = "**📊 當前積分排行榜：**\n";
+
+        if (sorted.length === 0) {
+          msg += "尚無任何積分紀錄，快來預測！";
+        } else {
+          for (let i = 0; i < sorted.length; i++) {
+            const [userId, score] = sorted[i];
+            try {
+              const user = await client.users.fetch(userId);
+              msg += `${i + 1}. ${user.username}：${score} 分\n`;
+            } catch {
+              msg += `${i + 1}. 未知使用者 (${userId})：${score} 分\n`;
+            }
+          }
+        }
+
+        await interaction.editReply({ content: msg });
+        break;
+      }
+
+      case "mypredictions": {
+        const myPredictionsMap = [];
+        for (const matchId in serverData.predictions) {
+          if (serverData.predictions[matchId][interaction.user.id]) {
+            const prediction =
+              serverData.predictions[matchId][interaction.user.id];
+            myPredictionsMap.push({ matchId, prediction });
+          }
+        }
+
+        if (myPredictionsMap.length === 0) {
+          await interaction.reply({
+            content: "你尚未預測任何比賽。",
+            flags: [MessageFlags.Ephemeral],
+          });
+        } else {
+          // 按照比賽 ID 排序
+          myPredictionsMap.sort((a, b) => a.matchId.localeCompare(b.matchId));
+          const myPredictions = myPredictionsMap.map(
+            (item) => `- ${item.matchId}: 預測 ${item.prediction}`,
+          );
+
+          await interaction.reply({
+            content: `您目前預測結果：\n${myPredictions.join("\n")}`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+        break;
+      }
+
+      case "history": {
+        const matchId = interaction.options.getString("比賽id").toUpperCase();
+        const predictions = serverData.predictions[matchId];
+
+        if (!predictions) {
+          return interaction.reply({
+            content: `查無比賽 \`${matchId}\` 的預測紀錄`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        const count = {};
+        for (const userId in predictions) {
+          const team = predictions[userId].toUpperCase();
+          count[team] = (count[team] || 0) + 1;
+        }
+
+        let result = `📊 \`${matchId}\` 預測統計：\n`;
+        for (const team in count) {
+          result += `- ${team}：${count[team]} 票\n`;
+        }
+
+        await interaction.reply({ content: result });
+        break;
+      }
+
+      case "follow": {
+        const targetUser = interaction.options.getUser("使用者");
+        const userId = interaction.user.id;
+        const targetId = targetUser.id;
+
+        if (userId === targetId) {
+          return interaction.reply({
+            content: "❌ 你不能跟單自己喔！",
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        const now = new Date();
+        let followed = [];
+        let skipped = [];
+        let alreadyPredicted = [];
+
+        for (const matchId of Object.keys(serverData.match_teams)) {
+          const deadline = new Date(serverData.match_schedules[matchId]);
+          if (now > deadline) continue;
+
+          const targetPrediction =
+            serverData.predictions?.[matchId]?.[targetId];
+          if (!targetPrediction) {
+            skipped.push(matchId);
+            continue;
+          }
+
+          if (serverData.predictions?.[matchId]?.[userId]) {
+            alreadyPredicted.push(matchId);
+            continue;
+          }
+
+          if (!serverData.predictions[matchId]) {
+            serverData.predictions[matchId] = {};
+          }
+
+          serverData.predictions[matchId][userId] = targetPrediction;
+          followed.push(`${matchId}：${targetPrediction}`);
+        }
+
+        saveData();
+
+        let msg = `📋 成功跟單 ${targetUser.username} 的預測如下：\n`;
+        if (followed.length > 0) msg += `✅ ${followed.join("\n")}\n`;
+        if (skipped.length > 0)
+          msg += `⏭️ 略過未預測場次：${skipped.join(", ")}\n`;
+        if (alreadyPredicted.length > 0)
+          msg += `🛑 以下場次你已預測，未覆蓋：${alreadyPredicted.join(", ")}`;
+
+        await interaction.reply({ content: msg });
+        break;
+      }
+
+      case "delete": {
+        const matchId = interaction.options.getString("比賽id").toUpperCase();
+
+        const matchExists =
+          serverData.match_teams[matchId] ||
+          serverData.match_schedules[matchId] ||
+          serverData.predictions[matchId] ||
+          serverData.match_history[matchId];
+
+        if (!matchExists) {
+          return interaction.reply({
+            content: `❌ 查無比賽 \`${matchId}\`，無需刪除。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        delete serverData.match_teams[matchId];
+        delete serverData.match_schedules[matchId];
+        delete serverData.match_points[matchId];
+        delete serverData.predictions[matchId];
+        delete serverData.match_history[matchId];
+        saveData();
+
+        await interaction.reply({
+          content: `🗑️ 已刪除比賽 \`${matchId}\` 的所有紀錄。`,
+        });
+        break;
+      }
+
+      case "undoresult": {
+        const matchId = interaction.options.getString("比賽id").toUpperCase();
+        const winner = serverData.match_history[matchId];
+
+        if (!winner) {
+          return interaction.reply({
+            content: "⚠️ 此比賽尚未結算，無法回溯結果。",
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        const predictions = serverData.predictions[matchId] || {};
+        const point = serverData.match_points[matchId] || 1;
+        let undoCount = 0;
+
+        for (const userId in predictions) {
+          if (predictions[userId].toUpperCase() === winner.toUpperCase()) {
+            serverData.scores[userId] =
+              (serverData.scores[userId] || 0) - point;
+            undoCount++;
+          }
+        }
+
+        delete serverData.match_history[matchId];
+        saveData();
+
+        await interaction.reply({
+          content: `🔄 已回溯比賽 \`${matchId}\` 結果，扣除 ${undoCount} 名預測 \`${winner}\` 使用者的 ${point} 分，請重新使用 \`/result\` 結算。`,
+        });
+        break;
+      }
+
+      case "addscore": {
+        const target = interaction.options.getUser("使用者");
+        const points = interaction.options.getInteger("分數");
+
+        serverData.scores[target.id] =
+          (serverData.scores[target.id] || 0) + points;
+        saveData();
+
+        await interaction.reply({
+          content: `✅ 已增加 ${target.username} 的 ${points} 分`,
+        });
+        break;
+      }
+
+      case "subscore": {
+        const target = interaction.options.getUser("使用者");
+        const points = interaction.options.getInteger("分數");
+
+        serverData.scores[target.id] =
+          (serverData.scores[target.id] || 0) - points;
+        saveData();
+
+        await interaction.reply({
+          content: `✅ 已減少 ${target.username} 的 ${points} 分`,
+        });
+        break;
+      }
+
+      case "forcepredict": {
+        const target = interaction.options.getUser("使用者");
+        const matchId = interaction.options.getString("比賽id").toUpperCase();
+        const predictedTeam = interaction.options
+          .getString("隊伍")
+          .toUpperCase();
+
+        if (!serverData.match_teams[matchId]) {
+          return interaction.reply({
+            content: `❌ 找不到比賽 \`${matchId}\`，請確認是否登錄。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        const validTeams = serverData.match_teams[matchId];
+        if (!validTeams.includes(predictedTeam)) {
+          return interaction.reply({
+            content: `❌ 錯誤，隊伍名稱應為 ${validTeams.join(" 或 ")}。`,
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        if (!serverData.predictions[matchId]) {
+          serverData.predictions[matchId] = {};
+        }
+
+        serverData.predictions[matchId][target.id] = predictedTeam;
+        saveData();
+
+        await interaction.reply({
+          content: `✅ 成功為 ${target.username} 設定 \`${matchId}\` 預測為 \`${predictedTeam}\``,
+        });
+        break;
+      }
+
+      case "resetall": {
+        const confirm = interaction.options.getBoolean("確認");
+
+        if (!confirm) {
+          return interaction.reply({
+            content: "❌ 請將「確認」選項設為 True 才能執行清空操作。",
+            flags: [MessageFlags.Ephemeral],
+          });
+        }
+
+        serverData.predictions = {};
+        serverData.scores = {};
+        serverData.match_history = {};
+        serverData.match_schedules = {};
+        serverData.match_teams = {};
+        serverData.match_points = {};
+        saveData();
+
+        await interaction.reply({
+          content:
+            "🧹 **已完全重置所有資料！**\n\n" +
+            "已清空內容：\n" +
+            "✅ 所有比賽資料\n" +
+            "✅ 所有預測紀錄\n" +
+            "✅ 所有積分紀錄\n" +
+            "✅ 所有比賽歷史\n" +
+            "系統已重新開始，可以登錄新的比賽了！",
+        });
+        break;
+      }
+
+      case "食物輪盤": {
+        // 台灣常見美食清單（150種）
+        const foodList = [
+          // 飯類
+          "滷肉飯",
+          "雞腿飯",
+          "排骨飯",
+          "焢肉飯",
+          "燒肉飯",
+          "烤肉飯",
+          "三寶飯",
+          "炸雞飯",
+          "咖哩飯",
+          "炒飯",
+          "蛋炒飯",
+          "海鮮炒飯",
+          "牛肉炒飯",
+          "鐵板燒",
+          "日式丼飯",
+          "親子丼",
+          "豬排飯",
+          "炸蝦飯",
+          "鰻魚飯",
+          "叉燒飯",
+          "油雞飯",
+          "海南雞飯",
+          "燒臘飯",
+          "鹹水雞飯",
+
+          // 麵類
+          "牛肉麵",
+          "陽春麵",
+          "乾麵",
+          "擔擔麵",
+          "炸醬麵",
+          "麻醬麵",
+          "榨菜肉絲麵",
+          "紅燒牛肉麵",
+          "清燉牛肉麵",
+          "羊肉麵",
+          "豬腳麵",
+          "排骨麵",
+          "餛飩麵",
+          "米粉湯",
+          "炒米粉",
+          "意麵",
+          "刀削麵",
+          "拉麵",
+          "烏龍麵",
+          "拌麵",
+          "涼麵",
+          "麻辣麵",
+          "大滷麵",
+          "三鮮麵",
+
+          // 湯麵、粉類
+          "米粉湯",
+          "肉羹麵",
+          "魚丸湯",
+          "貢丸湯",
+          "餛飩湯",
+          "酸辣湯",
+          "牛肉湯",
+          "虱目魚湯",
+          "河粉",
+          "板條",
+          "粄條",
+          "米苔目",
+          "麵疙瘩",
+
+          // 小吃類
+          "滷味",
+          "鹹酥雞",
+          "雞排",
+          "蚵仔煎",
+          "蚵仔麵線",
+          "臭豆腐",
+          "炸豆腐",
+          "肉圓",
+          "碗粿",
+          "米糕",
+          "筒仔米糕",
+          "油飯",
+          "肉粽",
+          "割包",
+          "刈包",
+          "胡椒餅",
+          "蔥油餅",
+          "蔥抓餅",
+          "煎餃",
+          "鍋貼",
+          "水餃",
+          "小籠包",
+          "生煎包",
+          "包子",
+
+          // 便當、定食
+          "雞腿便當",
+          "排骨便當",
+          "魚便當",
+          "控肉便當",
+          "爌肉便當",
+          "燒肉便當",
+          "烤雞便當",
+
+          // 火鍋、湯品
+          "火鍋",
+          "麻辣鍋",
+          "薑母鴨",
+          "羊肉爐",
+          "佛跳牆",
+          "麻油雞",
+
+          // 異國料理
+          "義大利麵",
+          "披薩",
+          "漢堡",
+          "炸雞",
+          "韓式料理",
+          "日式定食",
+          "泰式料理",
+          "越南河粉",
+          "印度咖哩",
+          "港式飲茶",
+          "港式燒臘",
+
+          // 素食
+          "素食便當",
+          "素食自助餐",
+          "素食麵",
+          "素食火鍋",
+
+          // 自助餐
+          "自助餐",
+          "自助火鍋",
+          "吃到飽",
+
+          // 港式料理細項
+          "煲仔飯",
+          "臘味煲仔飯",
+          "滑蛋牛肉飯",
+          "窩蛋牛肉飯",
+          "乾炒牛河",
+          "濕炒牛河",
+          "豉椒炒蜆",
+          "椒鹽九肚魚",
+          "椒鹽魷魚",
+          "豉汁蒸排骨",
+          "鳳爪",
+          "蝦餃",
+          "燒賣",
+          "叉燒包",
+          "腸粉",
+          "蘿蔔糕",
+          "芋頭糕",
+          "鹹水角",
+          "馬拉糕",
+          "雞扎",
+          "糯米雞",
+          "蝦腸粉",
+          "叉燒腸粉",
+          "牛肉腸粉",
+          "豬肝粥",
+          "皮蛋瘦肉粥",
+          "及第粥",
+          "艇仔粥",
+          "雲吞麵",
+          "車仔麵",
+          "魚蛋粉",
+          "豬紅粥",
+          "豬潤粥",
+
+          // 台灣小吃補充
+          "蚵嗲",
+          "蝦捲",
+          "棺材板",
+          "擔仔麵",
+          "筒仔米糕",
+          "碗粿",
+          "肉粿",
+          "虱目魚粥",
+          "四神湯",
+          "藥燉排骨",
+          "鹽水意麵",
+          "鱔魚麵",
+          "大腸麵線",
+          "花枝羹",
+          "魷魚羹",
+          "當歸鴨",
+          "三杯雞",
+          "炒飯糰",
+          "飯糰",
+        ];
+
+        // 隨機選擇一個食物
+        const randomFood = foodList[Math.floor(Math.random() * foodList.length)];
+
+        // 建立 Embed 訊息
+        const embed = new EmbedBuilder()
+          .setTitle("🎰 今天吃什麼？")
+          .setColor(0xff6b6b)
+          .setDescription(
+            `## 🎯 就決定是你了！\n\n` +
+            `# 🍽️ ${randomFood}\n\n` +
+            `───────────────`
+          )
+          .setFooter({
+            text: `🎲 從 ${foodList.length} 種美食中隨機抽選 | 不喜歡就再抽一次吧！`,
+          })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [embed] });
+        break;
+      }
+
+      case "help": {
+        const embed = new EmbedBuilder()
+          .setTitle("🍁 MSI 預測機器人指令表")
+          .setColor(0xecda24)
+          .addFields(
+            {
+              name: "💁 使用者指令",
+              value:
+                "`/predict` - 預測比賽贏家\n" +
+                "`/myscore` - 查看自己目前的分數\n" +
+                "`/mypredictions` - 查看預測紀錄\n" +
+                "`/matches` - 查看所有比賽\n" +
+                "`/history` - 查看預測統計\n" +
+                "`/leaderboard` - 查看計分板\n" +
+                "`/follow` - 跟單其他使用者\n",
+            },
+            {
+              name: "🔧 管理員指令",
+              value:
+                "`/register` - 登錄比賽\n" +
+                "`/result` - 登錄結果\n" +
+                "`/addscore` / `/subscore` - 調整分數\n" +
+                "`/forcepredict` - 代客登記\n" +
+                "`/delete` - 刪除比賽\n" +
+                "`/undoresult` - 回溯結果\n" +
+                "`/resetall` - 重置所有資料\n",
+            },
+            { name: "📘 說明", value: "所有指令都有參數提示和自動完成功能！" },
+          )
+          .setFooter({ text: "有狀況請找飼養員 Ruru⛄" });
+
+        await interaction.reply({
+          embeds: [embed],
+          flags: [MessageFlags.Ephemeral],
+        });
+        break;
+      }
+    }
+  } catch (error) {
+    console.error("指令執行錯誤:", error);
+
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({
+        content: "❌ 執行指令時發生錯誤，請稍後再試。",
+        flags: [MessageFlags.Ephemeral],
+      });
+    }
+  }
+});
+
+// 建立 Express 保活用伺服器
+const express = require("express");
+const app = express();
+
+app.get("/", (req, res) => {
+  res.send("🤖 Discord Bot 正在運行中（斜線指令版本）");
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🌐 網頁伺服器已啟動於 port ${PORT}`);
+});
+
+client.login(TOKEN);
