@@ -1,7 +1,7 @@
 {
   "name": "dc-race-bot",
   "version": "2.0.0",
-  "description": "Discord 賽事預測機器人（Zeabur + MongoDB 版）",
+  "description": "Discord 賽事預測機器人（Railway + MongoDB 版）",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

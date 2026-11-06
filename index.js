@@ -19,12 +19,12 @@ const MONGO_URI = process.env["MONGO_URI"];
 const guildSchema = new mongoose.Schema({
   guildId: { type: String, required: true, unique: true },
   // MongoDB 巢狀結構建議直接用混合型別或物件，配合原子操作最穩定
-  // 結構：matchId -> userId -> teamName
+  // 結構：matchId -> userId -> teamName（舊資料）或 { team, score }（score 可為 null，格式 "贏隊比分:輸隊比分"）
   predictions: { type: Map, of: mongoose.Schema.Types.Mixed, default: () => new Map() },
   // userId -> score
   scores: { type: Map, of: Number, default: () => new Map() },
-  // matchId -> winningTeam
-  match_history: { type: Map, of: String, default: () => new Map() },
+  // matchId -> winningTeam（字串，舊資料）或 { team, score }（score 可為 null）
+  match_history: { type: Map, of: mongoose.Schema.Types.Mixed, default: () => new Map() },
   // matchId -> ISO timestamp string
   match_schedules: { type: Map, of: String, default: () => new Map() },
   // matchId -> [teamA, teamB]
@@ -45,6 +45,41 @@ async function getServerData(guildId) {
   return doc;
 }
 
+// ── 比分預測機制 ───────────────────────────────────────────────────────────────
+// 比分格式一律為「贏隊比分:輸隊比分」，例如 3:1；贏隊比分必須大於輸隊比分。
+
+function parseScore(scoreStr) {
+  const m = /^\s*(\d+)\s*:\s*(\d+)\s*$/.exec(scoreStr);
+  if (!m) return null;
+  const w = Number(m[1]);
+  const l = Number(m[2]);
+  if (w <= l) return null;
+  return `${w}:${l}`;
+}
+
+// 把預測值正規化成 { team, score }：舊資料是純字串（無比分），新資料是物件。
+function normalizePrediction(raw) {
+  if (typeof raw === "string") return { team: raw, score: null };
+  if (raw && typeof raw === "object") return { team: raw.team, score: raw.score || null };
+  return { team: undefined, score: null };
+}
+
+// 結算值與預測值的儲存格式相同（{ team, score }，舊資料為純字串），共用同一套正規化邏輯。
+const normalizeHistory = normalizePrediction;
+
+// 依「猜對贏家＋比分」計算應得分數：
+// - 沒猜中贏家：0 分
+// - 猜中贏家、沒填比分：基礎分
+// - 猜中贏家、填了比分，但結算沒填實際比分：視為沒填比分，基礎分（不加成也不腰斬）
+// - 猜中贏家、比分也猜中：基礎分 x2
+// - 猜中贏家、比分猜錯：基礎分腰斬（向下取整，奇數分視為沒有加成）
+function calcAwardedPoints(predictionRaw, winningTeam, actualScore, basePoint) {
+  const { team, score } = normalizePrediction(predictionRaw);
+  if (typeof team !== "string" || team.toUpperCase() !== winningTeam) return 0;
+  if (!score || !actualScore) return basePoint;
+  return score === actualScore ? basePoint * 2 : Math.floor(basePoint / 2);
+}
+
 // ── Discord 客戶端 ─────────────────────────────────────────────────────────────
 
 const client = new Client({
@@ -58,7 +93,8 @@ const commands = [
     .setName("predict")
     .setDescription("預測比賽贏家")
     .addStringOption((o) => o.setName("比賽id").setDescription("輸入比賽ID（例如：R1）").setRequired(true).setAutocomplete(true))
-    .addStringOption((o) => o.setName("隊伍").setDescription("輸入預測獲勝的隊伍名稱").setRequired(true).setAutocomplete(true)),
+    .addStringOption((o) => o.setName("隊伍").setDescription("輸入預測獲勝的隊伍名稱").setRequired(true).setAutocomplete(true))
+    .addStringOption((o) => o.setName("比分").setDescription("可選：預測比分，格式「贏隊比分:輸隊比分」，例如 3:1。猜對贏家+比分可得雙倍分，比分猜錯則腰斬")),
 
   new SlashCommandBuilder()
     .setName("register")
@@ -77,7 +113,8 @@ const commands = [
     .setDescription("【管理員】登錄比賽結果")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addStringOption((o) => o.setName("比賽id").setDescription("比賽ID").setRequired(true).setAutocomplete(true))
-    .addStringOption((o) => o.setName("勝隊").setDescription("獲勝隊伍名稱").setRequired(true).setAutocomplete(true)),
+    .addStringOption((o) => o.setName("勝隊").setDescription("獲勝隊伍名稱").setRequired(true).setAutocomplete(true))
+    .addStringOption((o) => o.setName("比分").setDescription("可選：實際比分，格式「勝隊比分:負隊比分」，例如 3:2。留空則比分預測一律視為只猜贏家")),
 
   new SlashCommandBuilder().setName("matches").setDescription("查看所有已登錄的比賽"),
   new SlashCommandBuilder().setName("myscore").setDescription("查看自己的目前總積分"),
@@ -126,7 +163,8 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addUserOption((o) => o.setName("使用者").setDescription("選擇使用者").setRequired(true))
     .addStringOption((o) => o.setName("比賽id").setDescription("比賽ID").setRequired(true).setAutocomplete(true))
-    .addStringOption((o) => o.setName("隊伍").setDescription("預測隊伍").setRequired(true).setAutocomplete(true)),
+    .addStringOption((o) => o.setName("隊伍").setDescription("預測隊伍").setRequired(true).setAutocomplete(true))
+    .addStringOption((o) => o.setName("比分").setDescription("可選：預測比分，格式「贏隊比分:輸隊比分」，例如 3:1")),
 
   new SlashCommandBuilder()
     .setName("resetall")
@@ -220,6 +258,7 @@ client.on("interactionCreate", async (interaction) => {
       case "predict": {
         const matchId = interaction.options.getString("比賽id").toUpperCase();
         const predictedTeam = interaction.options.getString("隊伍").toUpperCase();
+        const scoreInput = interaction.options.getString("比分");
 
         const doc = await getServerData(guildId);
 
@@ -238,6 +277,17 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
+        let predictedScore = null;
+        if (scoreInput) {
+          predictedScore = parseScore(scoreInput);
+          if (!predictedScore) {
+            return interaction.reply({
+              content: "❌ 比分格式錯誤，請用「贏隊比分:輸隊比分」且贏隊比分要大於輸隊比分（例如 3:1）。",
+              flags: [MessageFlags.Ephemeral],
+            });
+          }
+        }
+
         const startTimeStr = doc.match_schedules.get(matchId);
         if (startTimeStr && new Date() >= new Date(startTimeStr)) {
           return interaction.reply({
@@ -249,10 +299,12 @@ client.on("interactionCreate", async (interaction) => {
         // 原子操作 $set，避免 doc.save() 造成的併發覆蓋
         await GuildData.updateOne(
           { guildId },
-          { $set: { [`predictions.${matchId}.${interaction.user.id}`]: predictedTeam } }
+          { $set: { [`predictions.${matchId}.${interaction.user.id}`]: { team: predictedTeam, score: predictedScore } } }
         );
 
-        await interaction.reply({ content: `✅ 你預測 \`${matchId}\` 比賽的贏家為：\`${predictedTeam}\`` });
+        await interaction.reply({
+          content: `✅ 你預測 \`${matchId}\` 比賽的贏家為：\`${predictedTeam}\`${predictedScore ? `，比分：\`${predictedScore}\`` : ""}`,
+        });
         break;
       }
 
@@ -322,6 +374,7 @@ client.on("interactionCreate", async (interaction) => {
       case "result": {
         const matchId = interaction.options.getString("比賽id").toUpperCase();
         const winningTeam = interaction.options.getString("勝隊").toUpperCase();
+        const scoreInput = interaction.options.getString("比分");
 
         const doc = await getServerData(guildId);
 
@@ -340,6 +393,17 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
+        let actualScore = null;
+        if (scoreInput) {
+          actualScore = parseScore(scoreInput);
+          if (!actualScore) {
+            return interaction.reply({
+              content: "❌ 比分格式錯誤，請用「勝隊比分:負隊比分」且勝隊比分要大於負隊比分（例如 3:2）。",
+              flags: [MessageFlags.Ephemeral],
+            });
+          }
+        }
+
         if (doc.match_history.get(matchId)) {
           return interaction.reply({
             content: `⚠️ 比賽 \`${matchId}\` 已結算過，若需要修正請使用 \`/undoresult\` 回溯。`,
@@ -354,11 +418,15 @@ client.on("interactionCreate", async (interaction) => {
           : (matchPredictions || {});
 
         const incOps = {};
+        let doubleCount = 0;
+        let halfCount = 0;
 
-        for (const [userId, team] of Object.entries(rawPredictions)) {
-          if (typeof team === "string" && team.toUpperCase() === winningTeam) {
-            incOps[`scores.${userId}`] = point;
-          }
+        for (const [userId, raw] of Object.entries(rawPredictions)) {
+          const awarded = calcAwardedPoints(raw, winningTeam, actualScore, point);
+          if (awarded <= 0) continue;
+          incOps[`scores.${userId}`] = awarded;
+          if (awarded === point * 2) doubleCount++;
+          else if (awarded < point) halfCount++;
         }
 
         // 把「尚未結算」的守衛放進 query，靠 matchedCount 判斷是否真的搶到，
@@ -366,7 +434,7 @@ client.on("interactionCreate", async (interaction) => {
         const res = await GuildData.updateOne(
           { guildId, [`match_history.${matchId}`]: { $exists: false } },
           {
-            $set: { [`match_history.${matchId}`]: winningTeam },
+            $set: { [`match_history.${matchId}`]: { team: winningTeam, score: actualScore } },
             ...(Object.keys(incOps).length > 0 && { $inc: incOps }),
           }
         );
@@ -378,7 +446,11 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
-        await interaction.reply({ content: `✅ 比賽 \`${matchId}\` 的勝隊是 \`${winningTeam}\`，積分已更新！` });
+        let resultMsg = `✅ 比賽 \`${matchId}\` 的勝隊是 \`${winningTeam}\`${actualScore ? `（比分 ${actualScore}）` : ""}，積分已更新！`;
+        if (doubleCount > 0) resultMsg += `\n🎯 比分全猜中：${doubleCount} 人獲得雙倍分數！`;
+        if (halfCount > 0) resultMsg += `\n🔸 猜中贏家但比分猜錯：${halfCount} 人分數腰斬。`;
+
+        await interaction.reply({ content: resultMsg });
         break;
       }
 
@@ -393,7 +465,7 @@ client.on("interactionCreate", async (interaction) => {
           const start = new Date(timeStr);
           const teams = doc.match_teams.get(matchId)?.join(" vs ") || "未知對戰組合";
           const point = doc.match_points.get(matchId) || 1;
-          const timeDisplay = start.toLocaleString("zh-TW", { timeZone: "Asia/Taipei" });
+          const timeDisplay = `<t:${Math.floor(start.getTime() / 1000)}:F>`;
           const line = `\`${matchId}\`｜${teams}｜${timeDisplay}｜${point} 分`;
 
           if (doc.match_history.get(matchId)) {
@@ -466,8 +538,8 @@ client.on("interactionCreate", async (interaction) => {
           const rawPredictions = matchPredictions instanceof Map
             ? Object.fromEntries(matchPredictions)
             : matchPredictions;
-          const team = rawPredictions?.[userId];
-          if (team) myList.push({ matchId, team });
+          const { team, score } = normalizePrediction(rawPredictions?.[userId]);
+          if (team) myList.push({ matchId, team, score });
         }
 
         if (myList.length === 0) {
@@ -475,7 +547,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         myList.sort((a, b) => a.matchId.localeCompare(b.matchId));
-        const lines = myList.map((item) => `- ${item.matchId}: 預測 ${item.team}`);
+        const lines = myList.map((item) => `- ${item.matchId}: 預測 ${item.team}${item.score ? `（比分 ${item.score}）` : ""}`);
         await interaction.reply({
           content: `您目前預測結果：\n${lines.join("\n")}`,
           flags: [MessageFlags.Ephemeral],
@@ -500,7 +572,8 @@ client.on("interactionCreate", async (interaction) => {
           : matchPredictions;
 
         const count = {};
-        for (const team of Object.values(rawPredictions)) {
+        for (const raw of Object.values(rawPredictions)) {
+          const { team } = normalizePrediction(raw);
           if (typeof team !== "string") continue;
           const t = team.toUpperCase();
           count[t] = (count[t] || 0) + 1;
@@ -550,13 +623,13 @@ client.on("interactionCreate", async (interaction) => {
             ? Object.fromEntries(matchPredictions)
             : (matchPredictions || {});
 
-          const targetTeam = rawPredictions[targetId];
+          const { team: targetTeam, score: targetScore } = normalizePrediction(rawPredictions[targetId]);
           if (!targetTeam) { skipped.push(matchId); continue; }
 
           if (rawPredictions[userId]) { alreadyPredicted.push(matchId); continue; }
 
-          updateOps[`predictions.${matchId}.${userId}`] = targetTeam;
-          followed.push(`${matchId}：${targetTeam}`);
+          updateOps[`predictions.${matchId}.${userId}`] = { team: targetTeam, score: targetScore };
+          followed.push(`${matchId}：${targetTeam}${targetScore ? `（比分 ${targetScore}）` : ""}`);
         }
 
         if (Object.keys(updateOps).length > 0) {
@@ -603,14 +676,16 @@ client.on("interactionCreate", async (interaction) => {
       case "undoresult": {
         const matchId = interaction.options.getString("比賽id").toUpperCase();
         const doc = await getServerData(guildId);
-        const winner = doc.match_history.get(matchId);
+        const historyRaw = doc.match_history.get(matchId);
 
-        if (!winner) {
+        if (!historyRaw) {
           return interaction.reply({
             content: "⚠️ 此比賽尚未結算，無法回溯結果。",
             flags: [MessageFlags.Ephemeral],
           });
         }
+
+        const { team: winner, score: actualScore } = normalizeHistory(historyRaw);
 
         const point = doc.match_points.get(matchId) || 1;
         const matchPredictions = doc.predictions.get(matchId);
@@ -619,19 +694,21 @@ client.on("interactionCreate", async (interaction) => {
           : (matchPredictions || {});
 
         let undoCount = 0;
+        let totalUndonePoints = 0;
         const incOps = {};
 
-        for (const [userId, team] of Object.entries(rawPredictions)) {
-          if (typeof team === "string" && team.toUpperCase() === winner.toUpperCase()) {
-            incOps[`scores.${userId}`] = -point;
-            undoCount++;
-          }
+        for (const [userId, raw] of Object.entries(rawPredictions)) {
+          const awarded = calcAwardedPoints(raw, winner.toUpperCase(), actualScore, point);
+          if (awarded <= 0) continue;
+          incOps[`scores.${userId}`] = -awarded;
+          undoCount++;
+          totalUndonePoints += awarded;
         }
 
-        // 守衛條件放進 query：只有目前仍是這個 winner 時才回溯，
+        // 守衛條件放進 query：只有目前仍是這個結算結果時才回溯（用 Mongo 的值比對，物件需整份相等），
         // 避免兩個 /undoresult 並發時重複扣分。
         const res = await GuildData.updateOne(
-          { guildId, [`match_history.${matchId}`]: winner },
+          { guildId, [`match_history.${matchId}`]: historyRaw },
           {
             $unset: { [`match_history.${matchId}`]: "" },
             ...(Object.keys(incOps).length > 0 && { $inc: incOps }),
@@ -646,7 +723,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         await interaction.reply({
-          content: `🔄 已回溯比賽 \`${matchId}\` 結果，扣除 ${undoCount} 名預測 \`${winner}\` 使用者的 ${point} 分，請重新使用 \`/result\` 結算。`,
+          content: `🔄 已回溯比賽 \`${matchId}\` 結果，扣除 ${undoCount} 名使用者，共 ${totalUndonePoints} 分，請重新使用 \`/result\` 結算。`,
         });
         break;
       }
@@ -684,6 +761,7 @@ client.on("interactionCreate", async (interaction) => {
         const target = interaction.options.getUser("使用者");
         const matchId = interaction.options.getString("比賽id").toUpperCase();
         const predictedTeam = interaction.options.getString("隊伍").toUpperCase();
+        const scoreInput = interaction.options.getString("比分");
         const doc = await getServerData(guildId);
 
         if (!doc.match_teams.get(matchId)) {
@@ -701,12 +779,25 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
+        let predictedScore = null;
+        if (scoreInput) {
+          predictedScore = parseScore(scoreInput);
+          if (!predictedScore) {
+            return interaction.reply({
+              content: "❌ 比分格式錯誤，請用「贏隊比分:輸隊比分」且贏隊比分要大於輸隊比分（例如 3:1）。",
+              flags: [MessageFlags.Ephemeral],
+            });
+          }
+        }
+
         await GuildData.updateOne(
           { guildId },
-          { $set: { [`predictions.${matchId}.${target.id}`]: predictedTeam } }
+          { $set: { [`predictions.${matchId}.${target.id}`]: { team: predictedTeam, score: predictedScore } } }
         );
 
-        await interaction.reply({ content: `✅ 成功為 ${target.username} 設定 \`${matchId}\` 預測為 \`${predictedTeam}\`` });
+        await interaction.reply({
+          content: `✅ 成功為 ${target.username} 設定 \`${matchId}\` 預測為 \`${predictedTeam}\`${predictedScore ? `，比分：\`${predictedScore}\`` : ""}`,
+        });
         break;
       }
 
@@ -788,7 +879,7 @@ client.on("interactionCreate", async (interaction) => {
             {
               name: "💁 使用者指令",
               value:
-                "`/predict` - 預測比賽贏家\n" +
+                "`/predict` - 預測比賽贏家（可選填比分，猜中雙倍／猜錯腰斬）\n" +
                 "`/myscore` - 查看自己目前的分數\n" +
                 "`/mypredictions` - 查看預測紀錄\n" +
                 "`/matches` - 查看所有比賽\n" +
@@ -800,7 +891,7 @@ client.on("interactionCreate", async (interaction) => {
               name: "🔧 管理員指令",
               value:
                 "`/register` - 登錄比賽\n" +
-                "`/result` - 登錄結果\n" +
+                "`/result` - 登錄結果（可選填實際比分）\n" +
                 "`/addscore` / `/subscore` - 調整分數\n" +
                 "`/forcepredict` - 代客登記\n" +
                 "`/delete` - 刪除比賽\n" +
@@ -838,14 +929,14 @@ app.listen(PORT, () => console.log(`🌐 網頁伺服器已啟動於 port ${PORT
 
 async function main() {
   if (!MONGO_URI) {
-    console.error("❌ 缺少環境變數 MONGO_URI，請在 Zeabur 設定後重啟。");
+    console.error("❌ 缺少環境變數 MONGO_URI，請在 Railway 設定後重啟。");
     process.exit(1);
   }
 
   await mongoose.connect(MONGO_URI);
   console.log("✅ MongoDB 連線成功！");
 
-  client.on("ready", async () => {
+  client.on("clientReady", async () => {
     console.log(`🤖 機器人上線：${client.user.tag}`);
     await registerCommands();
   });

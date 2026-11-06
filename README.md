@@ -2,7 +2,7 @@
 
 Discord 賽事預測競賽機器人。玩家用斜線指令預測比賽勝隊，管理員登錄比賽與結果，系統自動計分並產生排行榜。
 
-> 本分支（`main`）為正式部署版本，資料儲存於 **MongoDB**，部署於 **Zeabur**。
+> 本分支（`main`）為正式部署版本，資料儲存於 **MongoDB**，部署於 **Railway**。
 > 舊版（單機 JSON 儲存、Replit 部署）保留在 [`replit`](https://github.com/Sallynium/DC-race-bot/tree/replit) 分支，詳見該分支的 README。
 
 ---
@@ -15,7 +15,7 @@ Discord 賽事預測競賽機器人。玩家用斜線指令預測比賽勝隊，
 - [指令列表](#-指令列表)
 - [環境變數](#-環境變數)
 - [本機開發](#-本機開發)
-- [部署（Zeabur）](#-部署zeabur)
+- [部署（Railway）](#-部署railway)
 - [關鍵設計決策](#-關鍵設計決策)
 - [已知限制](#-已知限制)
 - [分支說明](#-分支說明)
@@ -24,8 +24,9 @@ Discord 賽事預測競賽機器人。玩家用斜線指令預測比賽勝隊，
 
 ## ✨ 功能總覽
 
-- **比賽預測**：玩家對「已登錄、未開賽」的比賽預測勝隊，開賽後鎖定無法再改。
-- **自動計分**：管理員登錄結果後，預測正確者自動依該場分數加分。
+- **比賽預測**：玩家對「已登錄、未開賽」的比賽預測勝隊，開賽後鎖定無法再改；可選填比分參與加成計分。
+- **自動計分**：管理員登錄結果後，預測正確者自動依該場分數加分；猜中比分雙倍、猜錯比分腰斬。
+- **動態時間戳**：`/matches` 的開賽時間使用 Discord `<t:...:F>` 時間戳，每位玩家依自己時區顯示。
 - **結果回溯**：`/undoresult` 可撤銷結算（扣回分數），修正後重新 `/result`。
 - **跟單**：`/follow` 一鍵複製其他玩家在所有「未截止」比賽的預測。
 - **排行榜 / 個人積分 / 預測統計**：多種查詢指令。
@@ -42,7 +43,7 @@ Discord 賽事預測競賽機器人。玩家用斜線指令預測比賽勝隊，
 | Discord 函式庫 | [discord.js](https://discord.js.org/) `^14.16.3` |
 | 資料庫 | MongoDB（透過 [Mongoose](https://mongoosejs.com/) `^8.4.0`） |
 | 保活 Web 伺服器 | [Express](https://expressjs.com/) `^4.18.2`（提供 `GET /` 健康檢查端點） |
-| 部署平台 | Zeabur |
+| 部署平台 | Railway |
 | 互動模型 | 全程使用 Slash Command + Autocomplete，無訊息內容權限需求 |
 
 **單檔架構**：所有邏輯集中在 [`index.js`](index.js)，啟動流程為
@@ -69,9 +70,9 @@ Discord 賽事預測競賽機器人。玩家用斜線指令預測比賽勝隊，
 ```js
 const guildSchema = new mongoose.Schema({
   guildId:         { type: String, required: true, unique: true },
-  predictions:     { type: Map, of: Schema.Types.Mixed,  default: () => new Map() }, // matchId -> { userId: teamName }
+  predictions:     { type: Map, of: Schema.Types.Mixed,  default: () => new Map() }, // matchId -> { userId: { team, score } }
   scores:          { type: Map, of: Number, default: () => new Map() },              // userId  -> 累計分數
-  match_history:   { type: Map, of: String, default: () => new Map() },              // matchId -> 勝隊（存在=已結算）
+  match_history:   { type: Map, of: Schema.Types.Mixed, default: () => new Map() },  // matchId -> { team, score }（存在=已結算）
   match_schedules: { type: Map, of: String, default: () => new Map() },              // matchId -> 開賽 ISO 時間字串
   match_teams:     { type: Map, of: [String], default: () => new Map() },            // matchId -> [隊伍A, 隊伍B]
   match_points:    { type: Map, of: Number, default: () => new Map() },              // matchId -> 預測正確得分
@@ -79,8 +80,8 @@ const guildSchema = new mongoose.Schema({
 ```
 
 **設計重點**：
-- `predictions` 採巢狀結構 `matchId → userId → teamName`，透過 MongoDB 點號路徑（dot-notation）做精準原子寫入，例如 `predictions.R1.123456789`。
-- `match_history` 是否含有某 `matchId` 即代表該場「是否已結算」，作為結算守衛的唯一真實來源。
+- `predictions` 採巢狀結構 `matchId → userId → { team, score }`（`score` 可為 `null`），透過 MongoDB 點號路徑（dot-notation）做精準原子寫入，例如 `predictions.R1.123456789`。舊資料為純字串（無比分）時仍可正確讀取（相容處理）。
+- `match_history` 是否含有某 `matchId` 即代表該場「是否已結算」，作為結算守衛的唯一真實來源；值為 `{ team, score }`（舊資料為純字串）。
 - 所有時間以 **ISO 字串（UTC）** 儲存，顯示時再轉台北時區（`Asia/Taipei`）。
 
 ---
@@ -91,7 +92,7 @@ const guildSchema = new mongoose.Schema({
 
 | 指令 | 說明 |
 |------|------|
-| `/predict 比賽id 隊伍` | 預測比賽勝隊（僅限未開賽，支援自動完成） |
+| `/predict 比賽id 隊伍 [比分]` | 預測比賽勝隊（僅限未開賽，支援自動完成）；可選填比分（格式「贏隊比分:輸隊比分」，例如 `3:1`）參與加成計分 |
 | `/myscore` | 查看自己目前總積分 |
 | `/mypredictions` | 查看自己所有預測紀錄 |
 | `/matches` | 查看所有比賽（依可預測／進行中／已結算分類） |
@@ -106,11 +107,11 @@ const guildSchema = new mongoose.Schema({
 | 指令 | 說明 |
 |------|------|
 | `/register 比賽id 隊伍a 隊伍b 日期 時間 [分數] [強制覆蓋]` | 登錄新比賽（日期 `YYYY-MM-DD`、時間 `HH:MM`，台北時間） |
-| `/result 比賽id 勝隊` | 登錄結果並自動計分 |
+| `/result 比賽id 勝隊 [比分]` | 登錄結果並自動計分；填入實際比分可讓玩家的比分預測結算加成／腰斬 |
 | `/undoresult 比賽id` | 回溯結果並扣回分數 |
 | `/addscore 使用者 分數` | 手動加分 |
 | `/subscore 使用者 分數` | 手動扣分 |
-| `/forcepredict 使用者 比賽id 隊伍` | 代替玩家預測（不受開賽時間限制） |
+| `/forcepredict 使用者 比賽id 隊伍 [比分]` | 代替玩家預測（不受開賽時間限制） |
 | `/delete 比賽id` | 刪除比賽及所有相關資料 |
 | `/resetall 確認` | ⚠️ 清空該伺服器所有資料（需二次確認） |
 
@@ -118,14 +119,14 @@ const guildSchema = new mongoose.Schema({
 
 ## 🔐 環境變數
 
-部署前需設定以下環境變數（Zeabur → 服務 → Variables）：
+部署前需設定以下環境變數（Railway → 服務 → Variables）：
 
 | 變數 | 說明 |
 |------|------|
 | `TOKEN` | Discord Bot Token |
 | `CLIENT_ID` | Discord 應用程式（Application）ID，用於註冊斜線指令 |
 | `MONGO_URI` | MongoDB 連線字串（例如 `mongodb+srv://...`） |
-| `PORT` | （選用）Express 監聽埠，預設 `3000`，Zeabur 通常自動注入 |
+| `PORT` | （選用）Express 監聽埠，預設 `3000`，Railway 通常自動注入 |
 
 > 缺少 `MONGO_URI` 時程式會直接以錯誤碼退出，避免在沒有資料庫的情況下啟動。
 
@@ -151,10 +152,10 @@ npm start
 
 ---
 
-## 🚀 部署（Zeabur）
+## 🚀 部署（Railway）
 
-1. 將 GitHub repo 連結至 Zeabur，選擇 `main` 分支。
-2. Zeabur 偵測為 Node.js 專案，使用 `npm start`（即 `node index.js`）。
+1. 將 GitHub repo 連結至 Railway，選擇 `main` 分支。
+2. Railway 偵測為 Node.js 專案，使用 `npm start`（即 `node index.js`）。
 3. 在 Variables 設定 `TOKEN`、`CLIENT_ID`、`MONGO_URI`。
 4. 部署完成後，Bot 上線會自動向 Discord 全域註冊斜線指令（首次最多需數分鐘生效）。
 5. `GET /` 端點可作為健康檢查／保活用途。
@@ -189,6 +190,16 @@ npm start
 6. **`follow` fail-closed**
    排程缺失、損毀、已結算、已截止的場次一律跳過；排程「異常」（缺失／無效）時額外 `console.warn` 方便除錯，正常截止則不記 log 以免洗版。
 
+7. **比分預測計分**
+   `/predict`／`/forcepredict` 可選填比分（格式「贏隊比分:輸隊比分」，贏隊比分須大於輸隊比分），`/result` 可選填實際比分。計分規則（以 `/register` 的基礎分 `point` 為準）：
+   - 猜對贏家、沒填比分：`point` 分
+   - 猜對贏家、填了比分，但 `/result` 沒填實際比分：視為沒填比分，一樣 `point` 分
+   - 猜對贏家、比分也猜中：`point × 2` 分
+   - 猜對贏家、比分猜錯：`floor(point / 2)` 分（奇數基礎分會直接變成沒有加成，例如 `point=1` 時腰斬為 0）
+   - 沒猜對贏家：0 分
+
+   結算結果 `match_history` 儲存為 `{ team, score }`（`score` 可為 `null`），`/undoresult` 用同一套規則反向計算每人應扣回的分數，確保回溯金額與當初加分一致。
+
 ---
 
 ## ⚠️ 已知限制
@@ -205,7 +216,7 @@ npm start
 
 | 分支 | 儲存方式 | 部署 | 用途 |
 |------|----------|------|------|
-| `main` | MongoDB + Mongoose | Zeabur | **正式版**，本文件對應版本 |
+| `main` | MongoDB + Mongoose | Railway | **正式版**，本文件對應版本 |
 | `replit` | 單機 JSON 檔（`predictions_data.json`） | Replit | 原型／封存版，見該分支 README |
 
 ---

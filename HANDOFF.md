@@ -7,7 +7,7 @@
 
 ## 📌 專案 / 任務背景
 
-Discord 賽事預測競賽機器人，`discord.js v14` + `Mongoose` + `MongoDB`，部署於 **Zeabur**。
+Discord 賽事預測競賽機器人，`discord.js v14` + `Mongoose` + `MongoDB`，部署於 **Railway**。
 
 - GitHub：https://github.com/Sallynium/DC-race-bot
 - 預設分支：`main`（MongoDB 版，正式部署）
@@ -75,7 +75,7 @@ Discord 賽事預測競賽機器人，`discord.js v14` + `Mongoose` + `MongoDB`�
 
 ---
 
-## ⚠️ 環境變數（Zeabur）
+## ⚠️ 環境變數（Railway）
 
 | 變數 | 用途 |
 |------|------|
